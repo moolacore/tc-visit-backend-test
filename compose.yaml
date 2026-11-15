@@ -15,7 +15,7 @@ services:
       AGENTS_SERVICE_URL: http://agents-service:3002
       VISITS_SERVICE_URL: http://visits-service:3003
       REPORTS_SERVICE_URL: http://reports-service:3004
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173,http://localhost:8080}
     restart: unless-stopped
     ports:
       - "3000:3000"
