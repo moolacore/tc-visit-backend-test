@@ -136,11 +136,32 @@ function whatsAppProviderReady() {
   return Boolean(String(process.env.WHAPI_API_TOKEN || '').trim());
 }
 
+const WHAPI_MIN_RETRY_SECONDS = 300;
+let whapiCooldownUntil = 0;
+
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds);
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, Math.ceil((timestamp - Date.now()) / 1000)) : null;
+}
+
+function whapiRateLimitError(retryAfterSeconds) {
+  const error = new Error('WhatsApp is temporarily limiting group operations. Wait before trying again; repeated requests can extend the restriction.');
+  error.statusCode = 429;
+  error.retryAfterSeconds = Math.max(WHAPI_MIN_RETRY_SECONDS, Number(retryAfterSeconds) || 0);
+  return error;
+}
+
 async function whapiRequest(path, { method = 'GET', body } = {}) {
   if (!whatsAppProviderReady()) {
     const error = new Error('WhatsApp group API is not configured.');
     error.statusCode = 503;
     throw error;
+  }
+  if (Date.now() < whapiCooldownUntil) {
+    throw whapiRateLimitError(Math.ceil((whapiCooldownUntil - Date.now()) / 1000));
   }
   let response;
   try {
@@ -161,14 +182,25 @@ async function whapiRequest(path, { method = 'GET', body } = {}) {
     error.cause = cause;
     throw error;
   }
+  if (response.status === 429) {
+    await response.text();
+    const error = whapiRateLimitError(parseRetryAfter(response.headers.get('retry-after')));
+    error.providerStatusCode = 429;
+    whapiCooldownUntil = Math.max(whapiCooldownUntil, Date.now() + error.retryAfterSeconds * 1000);
+    throw error;
+  }
   const raw = await response.text();
   let data = {};
   try { data = raw ? JSON.parse(raw) : {}; } catch { /* Provider returned a non-JSON error. */ }
   if (!response.ok) {
-    const error = new Error('The WhatsApp provider rejected the group operation.');
-    error.statusCode = response.status;
+    const authFailure = response.status === 401 || response.status === 403;
+    const error = new Error(authFailure
+      ? 'Whapi.Cloud rejected the channel authorization. Ask an administrator to verify the configured channel token and confirm that the channel is authorized in Whapi.Cloud.'
+      : 'The WhatsApp provider rejected the group operation.');
+    // Keep provider auth failures out of the browser's 401 session-refresh flow.
+    error.statusCode = authFailure ? 502 : response.status;
+    error.providerStatusCode = response.status;
     error.ambiguous = response.status >= 500;
-    error.providerData = data;
     throw error;
   }
   return data;
@@ -192,6 +224,7 @@ function inviteDeliveryResponse(delivery, agents) {
     status: delivery.status || 'complete',
     inviteUrl: delivery.inviteUrl || '',
     checkedAt: delivery.checkedAt || null,
+    retryAfterAt: delivery.retryAfterAt || null,
     sentCount: 0,
     sentAgents: [],
     notWhatsAppAgents: [],
@@ -272,17 +305,24 @@ async function sendSectorWhatsAppInvites({ agents, inviteUrl, previousDelivery, 
     const previous = previousById.get(agentId);
     return !(previous?.phoneFingerprint === fingerprint && ['sent', 'missing_phone', 'invalid_phone'].includes(previous.status));
   }));
+  const previousRetryAt = Date.parse(previousDelivery?.retryAfterAt || '');
+  if (sameInvite && Number.isFinite(previousRetryAt) && previousRetryAt > Date.now()) {
+    return { ...previousDelivery, status: 'provider_error' };
+  }
   let contactsByNumber = new Map();
   let contactsError = null;
   if (pendingNumbers.length) {
     try {
-      const result = await whapiRequest('/contacts', { method: 'POST', body: { contacts: pendingNumbers, force_check: true } });
+      // Reuse Whapi's cached contact checks; force_check bypasses that cache and
+      // needlessly increases provider traffic every time a TC retries a link.
+      const result = await whapiRequest('/contacts', { method: 'POST', body: { contacts: pendingNumbers } });
       contactsByNumber = new Map((Array.isArray(result.contacts) ? result.contacts : []).map((contact) => [normalizeWhatsAppNumber(contact.input || contact.phone || contact.wa_id), String(contact.status || '').toLowerCase()]));
     } catch (error) {
       contactsError = error;
     }
   }
 
+  let sendError = null;
   if (contactsError) {
     for (const number of pendingNumbers) {
       for (const agent of numbers.get(number)) entries.set(agent.agentId, { ...agent, status: 'check_failed' });
@@ -302,21 +342,29 @@ async function sendSectorWhatsAppInvites({ agents, inviteUrl, previousDelivery, 
       const greeting = agentNames.length === 1 ? `Hello ${agentNames[0]},` : 'Hello,';
       return [number, `${greeting} you are invited to join the ${description} WhatsApp group. Join using this link: ${inviteUrl}`];
     }));
-    await runWithConcurrency(validNumbers, 3, async (number) => {
+    await runWithConcurrency(validNumbers, 1, async (number) => {
       let status = 'sent';
       try {
         await whapiRequest('/messages/text', { method: 'POST', body: { to: number, body: messageByNumber.get(number) } });
-      } catch {
+      } catch (error) {
+        if (error.statusCode === 429) sendError = error;
         status = 'send_failed';
       }
       for (const agent of numbers.get(number)) entries.set(agent.agentId, { ...agent, status });
+      // Pace outbound invitations to avoid bursts that can trigger WhatsApp
+      // anti-spam restrictions on the linked channel.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     });
   }
 
+  const rateLimitError = contactsError?.statusCode === 429 ? contactsError : sendError;
   const delivery = {
     inviteUrl,
-    status: contactsError ? 'provider_error' : 'complete',
+    status: contactsError || sendError ? 'provider_error' : 'complete',
     checkedAt: new Date().toISOString(),
+    retryAfterAt: rateLimitError
+      ? new Date(Date.now() + Math.max(WHAPI_MIN_RETRY_SECONDS, Number(rateLimitError.retryAfterSeconds) || 0) * 1000).toISOString()
+      : null,
     entries: [...entries.values()],
   };
   await saveInviteDelivery(prisma, { key: deliveryKey, value: delivery, description, userId });
@@ -439,6 +487,7 @@ async function getMoolaPlusGroups(req) {
         groupName: stored.groupName || `DDIN ${group.name}`,
         groupId: stored.groupId || null,
         createdAt: stored.createdAt || null,
+        retryAfterAt: stored.retryAfterAt || null,
         attemptedCount: Number.isInteger(stored.attemptedCount) ? stored.attemptedCount : (stored.attemptedAgentIds || []).length,
         addedCount: Number.isInteger(stored.addedCount) ? stored.addedCount : (stored.addedAgentIds || []).length,
         failedCount: Number.isInteger(stored.failedCount) ? stored.failedCount : (stored.failedAgentIds || []).length,
@@ -479,6 +528,7 @@ async function getIremboWhatsAppGroups(req, areaType) {
       group: group ? {
         status: group.status || 'active', groupName: group.groupName || `DDIN ${area.name}`,
         groupId: group.groupId || null, createdAt: group.createdAt || null,
+        retryAfterAt: group.retryAfterAt || null,
         attemptedCount: Number.isInteger(group.attemptedCount) ? group.attemptedCount : (group.attemptedAgentIds || []).length,
         addedCount: Number.isInteger(group.addedCount) ? group.addedCount : (group.addedAgentIds || []).length,
         failedCount: Number.isInteger(group.failedCount) ? group.failedCount : (group.failedAgentIds || []).length,
@@ -497,7 +547,24 @@ async function saveAreaWhatsAppGroup(client, key, description, value, userId) {
   });
 }
 
-async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
+const activeAreaWhatsAppOperations = new Set();
+
+async function createOrUpdateAreaWhatsAppGroup(args) {
+  const lockId = `${args.network}:${args.group.id}`;
+  if (activeAreaWhatsAppOperations.has(lockId)) {
+    const error = new Error('A WhatsApp group request is already running for this area. Refresh the page before trying again.');
+    error.statusCode = 409;
+    throw error;
+  }
+  activeAreaWhatsAppOperations.add(lockId);
+  try {
+    return await performAreaWhatsAppGroupOperation(args);
+  } finally {
+    activeAreaWhatsAppOperations.delete(lockId);
+  }
+}
+
+async function performAreaWhatsAppGroupOperation({ req, group, network }) {
   const prefix = network === 'MOOLA_PLUS' ? 'Moola Plus' : 'Irembo';
   const groupName = String(req.body?.groupName || '').trim();
   if (!groupName || groupName.length > 25) {
@@ -536,7 +603,23 @@ async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
       tx.systemConfig.findUnique({ where: { key: inviteKey }, select: { value: true } }),
     ]);
     const stored = parseSystemConfigJson(storedRow?.value);
-    if (stored) return { group: stored, created: false };
+    if (stored?.status === 'rate_limited') {
+      const retryAt = Date.parse(stored.retryAfterAt || '');
+      if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+        const error = whapiRateLimitError(Math.ceil((retryAt - Date.now()) / 1000));
+        error.message = 'WhatsApp temporarily limited this group operation. Wait for the cooldown before trying again.';
+        throw error;
+      }
+      await tx.systemConfig.deleteMany({ where: { key: groupKey } });
+    } else if (stored?.status === 'active') {
+      const retryAt = Date.parse(stored.retryAfterAt || '');
+      if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+        const error = whapiRateLimitError(Math.ceil((retryAt - Date.now()) / 1000));
+        error.message = 'WhatsApp temporarily limited this group operation. Wait for the cooldown before trying again.';
+        throw error;
+      }
+      return { group: stored, created: false };
+    } else if (stored) return { group: stored, created: false };
     if (invite?.value) {
       const error = new Error('A manual WhatsApp invite link is already saved. Remove it before creating a provider-managed group.');
       error.statusCode = 409; throw error;
@@ -567,6 +650,14 @@ async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
       providerGroup = await whapiRequest('/groups', { method: 'POST', body: { subject: reserved.group.groupName, participants: [...byNumber.keys()] } });
     } catch (error) {
       if (error.ambiguous) await saveAreaWhatsAppGroup(prisma, groupKey, description, { ...reserved.group, status: 'needs_review' }, req.user.id);
+      else if (error.statusCode === 429) {
+        const retryAfterSeconds = Math.max(WHAPI_MIN_RETRY_SECONDS, Number(error.retryAfterSeconds) || 0);
+        error.retryAfterSeconds = retryAfterSeconds;
+        await saveAreaWhatsAppGroup(prisma, groupKey, description, {
+          ...reserved.group, status: 'rate_limited',
+          retryAfterAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+        }, req.user.id);
+      }
       else await prisma.systemConfig.deleteMany({ where: { key: groupKey } });
       throw error;
     }
@@ -606,6 +697,12 @@ async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
     const error = new Error('This group is not ready for member updates. Ask an administrator to review its provider status.');
     error.statusCode = 409; throw error;
   }
+  const retryAt = Date.parse(stored.retryAfterAt || '');
+  if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+    const error = whapiRateLimitError(Math.ceil((retryAt - Date.now()) / 1000));
+    error.message = 'WhatsApp temporarily limited this group operation. Wait for the cooldown before trying again.';
+    throw error;
+  }
   const attempted = new Set(stored.attemptedAgentIds || []);
   const newNumbers = [...byNumber.entries()].filter(([, ids]) => !ids.every((id) => attempted.has(id))).map(([number]) => number);
   if (!newNumbers.length) return {
@@ -614,10 +711,23 @@ async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
     missingPhoneCount, invalidPhoneCount, message: 'All recorded agents have already been processed for this group.',
   };
   const requested = new Set(newNumbers);
-  const result = await whapiRequest(`/groups/${encodeURIComponent(stored.groupId)}/participants`, { method: 'POST', body: { participants: newNumbers } });
+  let result;
+  try {
+    result = await whapiRequest(`/groups/${encodeURIComponent(stored.groupId)}/participants`, { method: 'POST', body: { participants: newNumbers } });
+  } catch (error) {
+    if (error.statusCode === 429) {
+      const retryAfterSeconds = Math.max(WHAPI_MIN_RETRY_SECONDS, Number(error.retryAfterSeconds) || 0);
+      error.retryAfterSeconds = retryAfterSeconds;
+      await saveAreaWhatsAppGroup(prisma, groupKey, description, {
+        ...stored, retryAfterAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+      }, req.user.id);
+    }
+    throw error;
+  }
   const { addedNumbers, failedNumbers } = getProviderParticipantResult(result, requested);
   const updated = {
     ...stored,
+    retryAfterAt: null,
     attemptedAgentIds: [...new Set([...attempted, ...newNumbers.flatMap((number) => byNumber.get(number) || [])])],
     addedAgentIds: [...new Set([...(stored.addedAgentIds || []), ...[...addedNumbers].flatMap((number) => byNumber.get(number) || [])])],
     failedAgentIds: [...new Set([...(stored.failedAgentIds || []), ...[...failedNumbers].flatMap((number) => byNumber.get(number) || [])])],
@@ -847,8 +957,10 @@ router.post('/whatsapp-area-groups/:areaId/create', authenticateToken, requireTe
     if (resolved.error) return res.status(req.query.type && !requestedWhatsAppAreaType(req) ? 400 : 404).json({ error: resolved.error });
     return res.status(201).json(await createOrUpdateAreaWhatsAppGroup({ req, group: resolved.group, network: 'IREMBO' }));
   } catch (error) {
+    if (error.providerStatusCode) console.warn('Irembo Whapi group request rejected:', error.providerStatusCode);
+    if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message, missingPhoneCount: error.missingPhoneCount, invalidPhoneCount: error.invalidPhoneCount });
-    console.error('Irembo WhatsApp area group operation failed:', error.code || error.name);
+    console.error('Irembo WhatsApp area group operation failed:', error.providerStatusCode || error.code || error.name);
     return res.status(502).json({ error: 'Could not complete the WhatsApp group operation.' });
   }
 });
@@ -866,8 +978,10 @@ router.post('/moola-plus-whatsapp-area-groups/:areaId/create', authenticateToken
     if (resolved.error) return res.status(req.query.type && !requestedWhatsAppAreaType(req) ? 400 : 404).json({ error: resolved.error });
     return res.status(201).json(await createOrUpdateAreaWhatsAppGroup({ req, group: resolved.group, network: 'MOOLA_PLUS' }));
   } catch (error) {
+    if (error.providerStatusCode) console.warn('Moola Plus Whapi group request rejected:', error.providerStatusCode);
+    if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message, missingPhoneCount: error.missingPhoneCount, invalidPhoneCount: error.invalidPhoneCount });
-    console.error('Moola Plus WhatsApp area group operation failed:', error.statusCode || error.code || error.name);
+    console.error('Moola Plus WhatsApp area group operation failed:', error.providerStatusCode || error.statusCode || error.code || error.name);
     return res.status(error.statusCode || 502).json({ error: 'Could not complete the WhatsApp group operation.' });
   }
 });
