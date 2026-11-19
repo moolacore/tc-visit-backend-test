@@ -499,6 +499,12 @@ async function saveAreaWhatsAppGroup(client, key, description, value, userId) {
 
 async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
   const prefix = network === 'MOOLA_PLUS' ? 'Moola Plus' : 'Irembo';
+  const groupName = String(req.body?.groupName || '').trim();
+  if (!groupName || groupName.length > 25) {
+    const error = new Error('Enter a WhatsApp group name between 1 and 25 characters.');
+    error.statusCode = 400;
+    throw error;
+  }
   const description = `${prefix} ${areaLabel(group.type)} group for ${group.path || group.name}`;
   const lockId = `${network}:${group.id}`;
   const groupKey = group.keys.group;
@@ -537,7 +543,7 @@ async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
     }
     const pending = {
       provider: 'whapi', status: 'creating', requestId: crypto.randomUUID(),
-      groupName: `DDIN ${group.name} ${group.parentName || group.districtName}`.trim().slice(0, 25),
+      groupName,
       createdAt: new Date().toISOString(), createdById: req.user.id,
       attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [],
       attemptedCount: 0, addedCount: 0, failedCount: 0,
@@ -1254,6 +1260,8 @@ router.put('/moola-plus-sector-groups/:groupId', authenticateToken, requireTerri
 
 router.post('/moola-plus-sector-groups/:groupId/create', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   if (req.body?.confirmAgentConsent !== true) return res.status(400).json({ error: 'Confirm that every agent being added agreed to join this group and share their phone number with the WhatsApp provider.' });
+  const groupName = String(req.body?.groupName || '').trim();
+  if (!groupName || groupName.length > 25) return res.status(400).json({ error: 'Enter a WhatsApp group name between 1 and 25 characters.' });
   if (!whatsAppProviderReady()) return res.status(503).json({ error: 'Automatic WhatsApp group creation is not configured. An administrator must set WHAPI_API_TOKEN for AgentsService.' });
   try {
     const group = (await getMoolaPlusGroups(req)).find((item) => item.id === String(req.params.groupId));
@@ -1279,7 +1287,7 @@ router.post('/moola-plus-sector-groups/:groupId/create', authenticateToken, requ
       if (current) return { group: current, created: false };
       const invite = await tx.systemConfig.findUnique({ where: { key: moolaWhatsAppInviteKey(group.id) }, select: { value: true } });
       if (invite?.value) { const conflict = new Error('A manual WhatsApp group link is already saved for this sector. Remove it before creating a provider-managed group.'); conflict.statusCode = 409; throw conflict; }
-      const pending = { provider: 'whapi', status: 'creating', requestId: crypto.randomUUID(), groupName: `DDIN ${group.name} ${group.districtName}`.slice(0, 25), createdAt: new Date().toISOString(), createdById: req.user.id, attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [], attemptedCount: 0, addedCount: 0, failedCount: 0 };
+      const pending = { provider: 'whapi', status: 'creating', requestId: crypto.randomUUID(), groupName, createdAt: new Date().toISOString(), createdById: req.user.id, attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [], attemptedCount: 0, addedCount: 0, failedCount: 0 };
       await saveMoolaWhatsAppGroup(tx, group, pending, req.user.id);
       return { group: pending, created: true };
     }, { timeout: 10000 });
