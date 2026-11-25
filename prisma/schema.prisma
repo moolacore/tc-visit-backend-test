@@ -286,6 +286,7 @@ model Agent {
   village                      Territory?               @relation("AgentVillage", fields: [villageId], references: [id])
   firstVisitLocationCapturedAt DateTime?
   firstVisitCompletedAt        DateTime?
+  tcLocationDetailsCompletedAt DateTime?
   championId                   String?                  @db.Uuid
   champion                     User?                    @relation("AgentChampion", fields: [championId], references: [id])
   status                       AgentStatus              @default(ACTIVE)
@@ -349,6 +350,7 @@ model AgentRelocationRequest {
   toSectorId      String                       @db.Uuid
   toCellId        String                       @db.Uuid
   toVillageId     String                       @db.Uuid
+  toVenue         String?                      @db.VarChar(200)
   latitude        Float?
   longitude       Float?
   accuracy        Float?
@@ -452,6 +454,7 @@ model MoolaAgentLocation {
   isOnHold                Boolean                  @default(false)
   firstLocationCapturedAt DateTime?
   firstVisitCompletedAt   DateTime?
+  tcLocationDetailsCompletedAt DateTime?
   updatedById             String                   @db.Uuid
   updatedAt               DateTime                 @updatedAt
   createdAt               DateTime                 @default(now())
@@ -470,6 +473,10 @@ model MoolaRelocationRequest {
   fromTerritory   Territory                    @relation("MoolaRelocationFromTerritory", fields: [fromTerritoryId], references: [id])
   toTerritoryId   String                       @db.Uuid
   toTerritory     Territory                    @relation("MoolaRelocationToTerritory", fields: [toTerritoryId], references: [id])
+  toSectorId      String?                      @db.Uuid
+  toCellId        String?                      @db.Uuid
+  toVillageId     String?                      @db.Uuid
+  toVenue         String?                      @db.VarChar(200)
   reason          String?                      @db.VarChar(500)
   requestedByTcId String                       @db.Uuid
   requestedByTc   User                         @relation("MoolaRelocationCreator", fields: [requestedByTcId], references: [id])
