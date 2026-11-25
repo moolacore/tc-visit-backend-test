@@ -1799,6 +1799,15 @@ router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireR
         conflict.statusCode = 409;
         throw conflict;
       }
+      const [approvedRelocation, completedTcTransfer] = await Promise.all([
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'COMPLETED', adminRoutedAt: null }, select: { id: true } }),
+      ]);
+      if (approvedRelocation || completedTcTransfer) {
+        const conflict = new Error('This agent has already had a TC move. Ask an administrator to handle any further transfer or relocation.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       return tx.agentTransfer.create({ data: {
         agentId: agent.id,
         fromTerritoryId: agent.territoryId,
@@ -1943,9 +1952,12 @@ router.post('/:id/relocation-requests', authenticateToken, requireTerritoryAcces
         conflict.statusCode = 409;
         throw conflict;
       }
-      const previousTcRelocation = await tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } });
-      if (previousTcRelocation) {
-        const conflict = new Error('The TC relocation allowance for this agent has already been used. Ask an administrator to make any further move.');
+      const [previousTcRelocation, previousTcTransfer] = await Promise.all([
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'COMPLETED', adminRoutedAt: null }, select: { id: true } }),
+      ]);
+      if (previousTcRelocation || previousTcTransfer) {
+        const conflict = new Error('This agent has already had a TC move. Ask an administrator to handle any further transfer or relocation.');
         conflict.statusCode = 409;
         throw conflict;
       }
@@ -2135,18 +2147,20 @@ router.get('/:id', authenticateToken, requireTerritoryAccess, requireRole('ADMIN
       include: {
         territory: true, sector: true, cell: true, village: true, champion: true,
         transfers: { where: { status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true, recipientTcId: true, toTerritory: { select: { id: true, name: true } } } },
-        relocationRequests: { where: { status: 'PENDING', ...(req.user.role === 'TC' ? { requestedByTcId: req.user.id } : {}) }, orderBy: { requestedAt: 'desc' }, take: 1, select: { id: true, toTerritoryId: true, status: true, requestedAt: true, toTerritory: { select: { name: true } } } },
+        relocationRequests: { where: { status: 'PENDING' }, orderBy: { requestedAt: 'desc' }, take: 1, select: { id: true, toTerritoryId: true, status: true, requestedAt: true, toTerritory: { select: { name: true } } } },
       }
     });
     if (!agent) return res.status(404).json({ error: 'Not found' });
     if (req.user.role === 'TC') {
-      const [assignments, pendingTransfer, approvedRelocation] = await Promise.all([
+      const [assignments, pendingTransfer, approvedRelocation, completedTcTransfer] = await Promise.all([
         prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true }, select: { territoryId: true } }),
         prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true } }),
         prisma.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+        prisma.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'COMPLETED', adminRoutedAt: null }, select: { id: true } }),
       ]);
       if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer) return res.status(403).json({ error: 'Access denied to this agent.' });
       agent.tcRelocationUsed = Boolean(approvedRelocation);
+      agent.tcMoveUsed = Boolean(approvedRelocation || completedTcTransfer);
     }
     if (req.user.role === 'CHAMPION' && agent.championId !== req.user.id) return res.status(403).json({ error: 'Access denied to this agent.' });
     res.json({
