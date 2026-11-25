@@ -147,6 +147,7 @@ model User {
   agentLocationsRecorded           AgentLocation[]          @relation("AgentLocationRecordedBy")
   visits                           Visit[]                  @relation("VisitTc")
   visitsLocationReviewed           Visit[]                  @relation("VisitLocationReviewer")
+  adminInboxStates                 AdminInboxRequestState[]
   fieldWorkdayFollowUps            FieldWorkdayFollowUp[]   @relation("FieldWorkdayFollowUpTc")
   fieldWorkdayReviews              FieldWorkdayFollowUp[]   @relation("FieldWorkdayFollowUpReviewer")
   auditLogs                        AuditLog[]               @relation("AuditLogUser")
@@ -629,6 +630,20 @@ model AuditLog {
 
   @@index([createdAt])
   @@index([userId, createdAt])
+}
+
+model AdminInboxRequestState {
+  id             String    @id @default(uuid()) @db.Uuid
+  adminId        String    @db.Uuid
+  admin          User      @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  requestKey     String    @db.VarChar(220)
+  readAt         DateTime?
+  acknowledgedAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([adminId, requestKey])
+  @@index([adminId, acknowledgedAt])
 }
 
 model SystemConfig {
