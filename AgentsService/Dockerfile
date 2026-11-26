@@ -17,6 +17,9 @@ COPY AgentsService/package.json AgentsService/package-lock.json ./AgentsService/
 RUN cd AgentsService && npm ci --omit=dev
 
 COPY AgentsService/src ./AgentsService/src
+# Reject malformed route/source files during image build, before Docker can
+# replace a healthy Agents service with a container that crashes on startup.
+RUN find AgentsService/src -type f -name '*.js' -print0 | xargs -0 -r -n1 node --check
 RUN mkdir -p AgentsService/uploads
 RUN chown -R node:node /app
 
